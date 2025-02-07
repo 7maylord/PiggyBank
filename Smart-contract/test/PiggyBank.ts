@@ -1,127 +1,78 @@
-import {
-  time,
-  loadFixture,
-} from "@nomicfoundation/hardhat-toolbox/network-helpers";
-import { anyValue } from "@nomicfoundation/hardhat-chai-matchers/withArgs";
+import { time, loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
 import { expect } from "chai";
-import hre from "hardhat";
+import hre, { ethers } from "hardhat";
+import { Block } from "ethers";
 
-describe("Lock", function () {
-  // We define a fixture to reuse the same setup in every test.
-  // We use loadFixture to run this setup once, snapshot that state,
-  // and reset Hardhat Network to that snapshot in every test.
-  async function deployOneYearLockFixture() {
-    const ONE_YEAR_IN_SECS = 365 * 24 * 60 * 60;
-    const ONE_GWEI = 1_000_000_000;
+describe("PiggyBank Contract", () => {
+  const deployPiggyBankContract = async () => {
 
-    const lockedAmount = ONE_GWEI;
-    const unlockTime = (await time.latest()) + ONE_YEAR_IN_SECS;
+    const ADDRESS_ZERO = '0x0000000000000000000000000000000000000000';
+    const [manager, contributor1, contributor2, stranger] = await hre.ethers.getSigners();
+    
+    const targetAmount = ethers.parseEther("5"); // 5 ETH target
+    const withdrawalDate = (await time.latest()) + 86400; // 1 day in the future
+    
+    const PiggyBank = await hre.ethers.getContractFactory("PiggyBank");
+    const deployPiggyBank = await PiggyBank.deploy(targetAmount, withdrawalDate, manager.address);
+    
+    return { deployPiggyBank, manager, contributor1, contributor2, stranger, targetAmount, withdrawalDate, ADDRESS_ZERO };
+  };
 
-    // Contracts are deployed using the first signer/account by default
-    const [owner, otherAccount] = await hre.ethers.getSigners();
-
-    const Lock = await hre.ethers.getContractFactory("Lock");
-    const lock = await Lock.deploy(unlockTime, { value: lockedAmount });
-
-    return { lock, unlockTime, lockedAmount, owner, otherAccount };
-  }
-
-  describe("Deployment", function () {
-    it("Should set the right unlockTime", async function () {
-      const { lock, unlockTime } = await loadFixture(deployOneYearLockFixture);
-
-      expect(await lock.unlockTime()).to.equal(unlockTime);
+  describe("Deployment", () => {
+    it("should be deployed by the manager", async () => {
+      const { deployPiggyBank, manager } = await loadFixture(deployPiggyBankContract);
+      const runner = deployPiggyBank.runner as HardhatEthersSigner;
+      expect(runner.address).to.equal(manager.address);
     });
 
-    it("Should set the right owner", async function () {
-      const { lock, owner } = await loadFixture(deployOneYearLockFixture);
-
-      expect(await lock.owner()).to.equal(owner.address);
-    });
-
-    it("Should receive and store the funds to lock", async function () {
-      const { lock, lockedAmount } = await loadFixture(
-        deployOneYearLockFixture
-      );
-
-      expect(await hre.ethers.provider.getBalance(lock.target)).to.equal(
-        lockedAmount
-      );
-    });
-
-    it("Should fail if the unlockTime is not in the future", async function () {
-      // We don't use the fixture here because we want a different deployment
-      const latestTime = await time.latest();
-      const Lock = await hre.ethers.getContractFactory("Lock");
-      await expect(Lock.deploy(latestTime, { value: 1 })).to.be.revertedWith(
-        "Unlock time should be in the future"
-      );
+    it("should set the correct target amount and withdrawal date", async () => {
+      const { deployPiggyBank, targetAmount, withdrawalDate } = await loadFixture(deployPiggyBankContract);
+      expect(await deployPiggyBank.targetAmount()).to.equal(targetAmount);
+      expect(await deployPiggyBank.withdrawalDate()).to.equal(withdrawalDate);
     });
   });
 
-  describe("Withdrawals", function () {
-    describe("Validations", function () {
-      it("Should revert with the right error if called too soon", async function () {
-        const { lock } = await loadFixture(deployOneYearLockFixture);
-
-        await expect(lock.withdraw()).to.be.revertedWith(
-          "You can't withdraw yet"
-        );
-      });
-
-      it("Should revert with the right error if called from another account", async function () {
-        const { lock, unlockTime, otherAccount } = await loadFixture(
-          deployOneYearLockFixture
-        );
-
-        // We can increase the time in Hardhat Network
-        await time.increaseTo(unlockTime);
-
-        // We use lock.connect() to send a transaction from another account
-        await expect(lock.connect(otherAccount).withdraw()).to.be.revertedWith(
-          "You aren't the owner"
-        );
-      });
-
-      it("Shouldn't fail if the unlockTime has arrived and the owner calls it", async function () {
-        const { lock, unlockTime } = await loadFixture(
-          deployOneYearLockFixture
-        );
-
-        // Transactions are sent using the first signer by default
-        await time.increaseTo(unlockTime);
-
-        await expect(lock.withdraw()).not.to.be.reverted;
-      });
+  describe("Contributions", () => {
+    it("should allow users to contribute funds", async () => {
+      const { deployPiggyBank, contributor1 } = await loadFixture(deployPiggyBankContract);
+      const amount = ethers.parseEther("1");
+      await expect(deployPiggyBank.connect(contributor1).save({ value: amount }))
+        .to.emit(deployPiggyBank, "Contributed")
     });
 
-    describe("Events", function () {
-      it("Should emit an event on withdrawals", async function () {
-        const { lock, unlockTime, lockedAmount } = await loadFixture(
-          deployOneYearLockFixture
-        );
+    it("should reject contributions of zero value", async () => {
+      const { deployPiggyBank, contributor1 } = await loadFixture(deployPiggyBankContract);
+      await expect(deployPiggyBank.connect(contributor1).save({ value: 0 })).to.be.revertedWith("YOU ARE BROKE");
+    });
+  });
 
-        await time.increaseTo(unlockTime);
-
-        await expect(lock.withdraw())
-          .to.emit(lock, "Withdrawal")
-          .withArgs(lockedAmount, anyValue); // We accept any value as `when` arg
-      });
+  describe("Withdrawals", () => {
+    it("should only allow manager to withdraw after target date is reached", async () => {
+      const { deployPiggyBank, manager, contributor1, targetAmount, withdrawalDate } = await loadFixture(deployPiggyBankContract);
+      
+      await deployPiggyBank.connect(contributor1).save({ value: targetAmount });
+      await time.increaseTo(withdrawalDate);
+      
+      await expect(deployPiggyBank.connect(manager).withdrawal())
+        .to.emit(deployPiggyBank, "Withdrawn")
     });
 
-    describe("Transfers", function () {
-      it("Should transfer the funds to the owner", async function () {
-        const { lock, unlockTime, lockedAmount, owner } = await loadFixture(
-          deployOneYearLockFixture
-        );
+    it("should not allow withdrawal before target date", async () => {
+      const { deployPiggyBank, manager } = await loadFixture(deployPiggyBankContract);
+      await expect(deployPiggyBank.connect(manager).withdrawal()).to.be.revertedWith("NOT YET TIME");
+    });
 
-        await time.increaseTo(unlockTime);
+    it("should not allow withdrawal if target amount is not reached", async () => {
+      const { deployPiggyBank, manager, withdrawalDate } = await loadFixture(deployPiggyBankContract);
+      await time.increaseTo(withdrawalDate);
+      await expect(deployPiggyBank.connect(manager).withdrawal()).to.be.revertedWith("TARGET AMOUNT NOT REACHED");
+    });
 
-        await expect(lock.withdraw()).to.changeEtherBalances(
-          [owner, lock],
-          [lockedAmount, -lockedAmount]
-        );
-      });
+    it("should prevent non-managers from withdrawing", async () => {
+      const { deployPiggyBank, contributor1, withdrawalDate } = await loadFixture(deployPiggyBankContract);
+      await time.increaseTo(withdrawalDate);
+      await expect(deployPiggyBank.connect(contributor1).withdrawal()).to.be.revertedWith("YOU WAN THIEF ABI ?");
     });
   });
 });
